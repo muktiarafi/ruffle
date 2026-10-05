@@ -1,0 +1,153 @@
+name: Build macOS (Apple Silicon)
+
+# Builds the AQW Ruffle player for Apple Silicon Macs and packages it as
+# AQW.app (double-click to play), zipped.
+#
+# - Every push to main: the zip is attached to this run (Actions tab ->
+#   run -> Artifacts) and the "macos-latest" release is refreshed, so there is
+#   always a stable download link:
+#   https://github.com/<owner>/<repo>/releases/tag/macos-latest
+# - Can also be started by hand: Actions -> "Build macOS (Apple Silicon)" ->
+#   Run workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: macos-arm-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build AQW.app (aarch64)
+    runs-on: macos-15 # Apple Silicon runner
+    timeout-minutes: 120
+    env:
+      TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Picks the AQW window icon at build time (see desktop/build.rs).
+      ARTIX_RUFFLE_GAME_ICON: aqw
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      # Ruffle compiles its ActionScript built-ins with Java during the build.
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm-artix
+
+      - name: Cargo build
+        run: cargo build --locked --package ruffle_desktop --profile artix --target "$TARGET"
+
+      - name: Create AQW.app
+        run: |
+          set -euo pipefail
+          APP=package/AQW.app
+          mkdir -p package
+          cp -R desktop/packages/macOS "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/$TARGET/artix/ruffle_desktop" "$APP/Contents/MacOS/AQW-Ruffle"
+
+          # Double-clicking the app runs this launcher, which starts the
+          # player exactly like AE Ruffle Launcher does (game at 24 FPS,
+          # smooth motion at the display refresh rate).
+          cat > "$APP/Contents/MacOS/AQW" <<'LAUNCHER'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          URL="https://game.aq.com/game/gamefiles/Loader3.swf"
+          export ARTIX_RUFFLE_GAME=aqw
+          export ARTIX_RUFFLE_WINDOW_TITLE="AdventureQuest Worlds"
+          export RUFFLE_AQW_SMOOTH="${RUFFLE_AQW_SMOOTH:-max}"
+          exec "$DIR/AQW-Ruffle" "$URL" --spoof-url "$URL" \
+              --base "https://game.aq.com/game/gamefiles/" \
+              --graphics metal --quality low --power high --frame-rate 24 \
+              --scale exact-fit --force-scale --upgrade-to-https \
+              --player-version 32 -m 60 --no-gui --tcp-connections allow "$@"
+          LAUNCHER
+          chmod +x "$APP/Contents/MacOS/AQW" "$APP/Contents/MacOS/AQW-Ruffle"
+
+          # Rename the bundle from Ruffle to AQW.
+          plutil -replace CFBundleExecutable -string AQW "$APP/Contents/Info.plist"
+          plutil -replace CFBundleName -string AQW "$APP/Contents/Info.plist"
+          plutil -replace CFBundleDisplayName -string "AQW" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleIdentifier -string "io.github.phofirst.ruffleaq" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleShortVersionString -string "3.2.${{ github.run_number }}" "$APP/Contents/Info.plist"
+          plutil -replace LSMinimumSystemVersion -string "$MACOSX_DEPLOYMENT_TARGET" "$APP/Contents/Info.plist"
+
+      - name: Compile app icon
+        run: |
+          xcrun actool --compile package/AQW.app/Contents/Resources desktop/assets/Assets.xcassets \
+            --minimum-deployment-target 11.0 --platform macosx --include-all-app-icons \
+            --output-partial-info-plist /tmp/partial.plist --warnings --errors
+
+      - name: Ad-hoc sign
+        # No Apple developer certificate: an ad-hoc signature keeps Apple
+        # Silicon happy; first launch still needs right-click -> Open.
+        run: codesign --force --deep --sign - package/AQW.app
+
+      - name: Add README and zip
+        run: |
+          set -euo pipefail
+          cat > package/README.txt <<'EOF'
+          AQW for Mac (Apple Silicon)
+          ===========================
+          1. Unzip and drag AQW.app into Applications (or anywhere).
+          2. First time only: right-click AQW.app -> Open -> Open.
+             (macOS warns because the app isn't signed by a registered developer.)
+             If it says the app "is damaged", open Terminal and run:
+                 xattr -dr com.apple.quarantine /Applications/AQW.app
+          3. After that, just double-click AQW.app.
+
+          In game (hold fn on a Mac keyboard):
+            F6  settings panel (smooth FPS, fast effects, static art,
+                loading flames, memory + Clean memory)
+            F7  fast effects on/off (big FPS boost in Battleon)
+            F8  smooth motion: off / 30 / 45 / 60 / MAX
+            F9  CRT filter
+          EOF
+          cp LICENSE.md package/LICENSE.md
+          cd package
+          ditto -c -k --sequesterRsrc --keepParent AQW.app ../AQW-macos-arm64.zip
+          cd ..
+          zip -j AQW-macos-arm64.zip package/README.txt package/LICENSE.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AQW-macos-arm64
+          path: AQW-macos-arm64.zip
+
+      - name: Update "macos-latest" release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Latest Apple Silicon build of main (${GITHUB_SHA::8}). Download AQW-macos-arm64.zip, then see README.txt inside."
+          if gh release view macos-latest >/dev/null 2>&1; then
+            git push --force origin "HEAD:refs/tags/macos-latest"
+            gh release edit macos-latest --notes "$NOTES" --prerelease
+          else
+            gh release create macos-latest --target "$GITHUB_SHA" --title "AQW for Mac (Apple Silicon) - latest" --notes "$NOTES" --prerelease
+          fi
+          gh release upload macos-latest AQW-macos-arm64.zip --clobber
