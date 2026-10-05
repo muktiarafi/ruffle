@@ -48,7 +48,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/registry
           key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
