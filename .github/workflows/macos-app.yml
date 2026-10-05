@@ -27,7 +27,7 @@ jobs:
       TAG: ${{ inputs.tag }}
       DMG: AQW-Ruffle-${{ inputs.tag }}-arm64.dmg
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Non-cone patterns: check out everything, minus the two trees that
           # have nothing to do with compiling. release/ is 530 MB of committed
