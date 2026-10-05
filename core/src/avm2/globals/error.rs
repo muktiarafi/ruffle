@@ -1,0 +1,71 @@
+use crate::avm2::activation::Activation;
+use crate::avm2::error::Error;
+use crate::avm2::object::ErrorObject;
+use crate::avm2::parameters::ParametersExt;
+use crate::avm2::value::Value;
+use crate::string::{AvmString, WString};
+use crate::{PlayerMode, avm2_stub_method};
+
+pub use crate::avm2::object::error_allocator;
+
+pub fn init_custom_prototype<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+    let this = this.as_class_object().unwrap();
+
+    let prototype_error_object = ErrorObject::new(activation, this);
+
+    this.link_prototype(activation.context, prototype_error_object.into());
+
+    Ok(Value::Undefined)
+}
+
+pub fn get_error_message<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    _this: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_method!(activation, "Error", "getErrorMessage");
+
+    let id = args.get_i32(0);
+    let message = format!("Error #{id}");
+    Ok(AvmString::new_utf8(activation.gc(), message).into())
+}
+
+pub fn get_stack_trace<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    // See <https://docs.ruffle.rs/en_US/FlashPlatform/reference/actionscript/3/Error.html#getStackTrace()>
+    // But note that the behavior also depends on SWF version.
+    let stack_trace_enabled = if activation.context.player_version >= 18
+        && activation.caller_movie_or_root().version() >= 18
+    {
+        // For Flash Player 11.5+ and SWF>=18, stack traces are always enabled.
+        true
+    } else {
+        // For Flash Player Player 11.4 and earlier, or for SWF<18, stack traces are enabled for debug only.
+        activation.context.player_mode == PlayerMode::Debug
+    };
+
+    if !stack_trace_enabled {
+        return Ok(Value::Null);
+    }
+
+    if let Some(error) = this.as_error_object() {
+        let stringified = Value::from(error).coerce_to_string(activation)?;
+
+        let mut output = WString::new();
+        output.push_str(&stringified);
+        error.call_stack().display(&mut output);
+
+        return Ok(AvmString::new(activation.gc(), output).into());
+    }
+    Ok(Value::Null)
+}

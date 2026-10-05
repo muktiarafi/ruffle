@@ -1,0 +1,683 @@
+//! Core event structure
+
+use crate::avm2::Avm2;
+use crate::avm2::activation::Activation;
+use crate::avm2::function::FunctionArgs;
+use crate::avm2::value::Value;
+use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
+use crate::avm2::object::{EventObject, FunctionObject, FunctionObjectWeak, Object, TObject as _};
+use crate::display_object::TDisplayObject;
+use crate::string::AvmString;
+use fnv::FnvHashMap;
+use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use smallvec::SmallVec;
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+
+/// Which phase of event dispatch is currently occurring.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EventPhase {
+    /// The event has yet to be fired on the target and is descending the
+    /// ancestors of the event target.
+    Capturing = 1,
+
+    /// The event is currently firing on the target.
+    AtTarget = 2,
+
+    /// The event has already fired on the target and is ascending the
+    /// ancestors of the event target.
+    Bubbling = 3,
+}
+
+/// How this event is allowed to propagate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PropagationMode {
+    /// Propagate events normally.
+    Allow,
+
+    /// Stop capturing or bubbling events.
+    Stop,
+
+    /// Stop running event handlers altogether.
+    StopImmediate,
+}
+
+/// Represents data fields of an event that can be fired on an object that
+/// implements `IEventDispatcher`.
+#[derive(Clone, Collect)]
+#[collect(no_drop)]
+pub struct Event<'gc> {
+    /// Whether the event "bubbles" - fires on its parents after it
+    /// fires on the child.
+    bubbles: bool,
+
+    /// Whether the event has a default response that an event handler
+    /// can request to not occur.
+    cancelable: bool,
+
+    /// Whether the event's default response has been cancelled.
+    cancelled: bool,
+
+    /// Whether event propagation has stopped.
+    #[collect(require_static)]
+    propagation: PropagationMode,
+
+    /// The object currently having its event handlers invoked.
+    current_target: Option<Object<'gc>>,
+
+    /// The current event phase.
+    #[collect(require_static)]
+    event_phase: EventPhase,
+
+    /// The object this event was dispatched on.
+    target: Option<Object<'gc>>,
+
+    /// The name of the event being triggered.
+    event_type: AvmString<'gc>,
+}
+
+impl<'gc> Event<'gc> {
+    /// Construct a new event of a given type.
+    pub fn new(event_type: AvmString<'gc>) -> Self {
+        Event {
+            bubbles: false,
+            cancelable: false,
+            cancelled: false,
+            propagation: PropagationMode::Allow,
+            current_target: None,
+            event_phase: EventPhase::AtTarget,
+            target: None,
+            event_type,
+        }
+    }
+
+    pub fn event_type(&self) -> AvmString<'gc> {
+        self.event_type
+    }
+
+    pub fn set_event_type(&mut self, event_type: AvmString<'gc>) {
+        self.event_type = event_type;
+    }
+
+    pub fn is_bubbling(&self) -> bool {
+        self.bubbles
+    }
+
+    pub fn set_bubbles(&mut self, bubbling: bool) {
+        self.bubbles = bubbling;
+    }
+
+    pub fn is_cancelable(&self) -> bool {
+        self.cancelable
+    }
+
+    pub fn set_cancelable(&mut self, cancelable: bool) {
+        self.cancelable = cancelable;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    pub fn cancel(&mut self) {
+        if self.cancelable {
+            self.cancelled = true;
+        }
+    }
+
+    pub fn is_propagation_stopped(&self) -> bool {
+        self.propagation != PropagationMode::Allow
+    }
+
+    pub fn stop_propagation(&mut self) {
+        if self.propagation != PropagationMode::StopImmediate {
+            self.propagation = PropagationMode::Stop;
+        }
+    }
+
+    pub fn is_propagation_stopped_immediately(&self) -> bool {
+        self.propagation == PropagationMode::StopImmediate
+    }
+
+    pub fn stop_immediate_propagation(&mut self) {
+        self.propagation = PropagationMode::StopImmediate;
+    }
+
+    pub fn phase(&self) -> EventPhase {
+        self.event_phase
+    }
+
+    pub fn set_phase(&mut self, phase: EventPhase) {
+        self.event_phase = phase;
+    }
+
+    pub fn target(&self) -> Option<Object<'gc>> {
+        self.target
+    }
+
+    pub fn set_target(&mut self, target: Object<'gc>) {
+        self.target = Some(target)
+    }
+
+    pub fn current_target(&self) -> Option<Object<'gc>> {
+        self.current_target
+    }
+
+    pub fn set_current_target(&mut self, current_target: Object<'gc>) {
+        self.current_target = Some(current_target)
+    }
+}
+
+/// A set of handlers organized by event type, priority, and order added.
+#[derive(Clone, Collect)]
+#[collect(no_drop)]
+pub struct DispatchList<'gc>(FnvHashMap<AvmString<'gc>, BTreeMap<i32, Vec<EventHandler<'gc>>>>);
+
+impl<'gc> DispatchList<'gc> {
+    /// Construct a new dispatch list.
+    pub fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Get all of the event handlers for a given event type, if such a type
+    /// exists.
+    fn get_event(&self, event: AvmString<'gc>) -> Option<&BTreeMap<i32, Vec<EventHandler<'gc>>>> {
+        self.0.get(&event)
+    }
+
+    /// Get all of the event handlers for a given event type, for mutation.
+    ///
+    /// If the event type does not exist, it will be added to the dispatch
+    /// list.
+    fn get_event_mut(
+        &mut self,
+        event: AvmString<'gc>,
+    ) -> &mut BTreeMap<i32, Vec<EventHandler<'gc>>> {
+        self.0.entry(event).or_default()
+    }
+
+    /// Get a single priority level of event handlers for a given event type,
+    /// for mutation.
+    fn get_event_priority_mut(
+        &mut self,
+        event: AvmString<'gc>,
+        priority: i32,
+    ) -> &mut Vec<EventHandler<'gc>> {
+        self.0
+            .entry(event)
+            .or_default()
+            .entry(priority)
+            .or_default()
+    }
+
+    /// Add an event handler to this dispatch list.
+    ///
+    /// This enforces the invariant that an `EventHandler` must not appear at
+    /// more than one priority (since we can't enforce that with clever-er data
+    /// structure selection). If an event handler already exists, it will not
+    /// be added again, and this function will silently fail.
+    pub fn add_event_listener(
+        &mut self,
+        event: AvmString<'gc>,
+        priority: i32,
+        handler: FunctionObject<'gc>,
+        use_capture: bool,
+        use_weak_reference: bool,
+    ) {
+        let new_handler = EventHandler::new(handler, use_capture, use_weak_reference);
+
+        if let Some(event_sheaf) = self.get_event(event) {
+            for other_set in event_sheaf.values() {
+                if other_set.contains(&new_handler) {
+                    return;
+                }
+            }
+        }
+
+        self.get_event_priority_mut(event, priority)
+            .push(new_handler);
+    }
+
+    /// Remove an event handler from this dispatch list.
+    ///
+    /// Any listener that has the same handler and capture-phase flag will be
+    /// removed from any priority in the list.
+    pub fn remove_event_listener(
+        &mut self,
+        event: AvmString<'gc>,
+        handler: FunctionObject<'gc>,
+        use_capture: bool,
+    ) {
+        let old_handler = EventHandler::new(handler, use_capture, false);
+
+        for set in self.get_event_mut(event).values_mut() {
+            if let Some(pos) = set.iter().position(|h| *h == old_handler) {
+                set.remove(pos);
+            }
+        }
+    }
+
+    /// Determine if there are any event listeners in this dispatch list.
+    pub fn has_event_listener(&mut self, event: AvmString<'gc>, mc: &Mutation<'gc>) -> bool {
+        self.prune_dead_handlers(event, mc);
+
+        if let Some(event_sheaf) = self.get_event(event) {
+            for set in event_sheaf.values() {
+                if !set.is_empty() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Yield the event handlers on this dispatch list for a given event.
+    ///
+    /// Event handlers will be yielded in the order they are intended to be
+    /// executed.
+    ///
+    /// `use_capture` indicates if you want handlers that execute during the
+    /// capture phase, or handlers that execute during the bubble and target
+    /// phases.
+    pub fn event_handlers(
+        &mut self,
+        event: AvmString<'gc>,
+        use_capture: bool,
+        mc: &Mutation<'gc>,
+    ) -> SmallVec<[FunctionObject<'gc>; 2]> {
+        self.prune_dead_handlers(event, mc);
+
+        self.get_event_mut(event)
+            .iter()
+            .rev()
+            .flat_map(|(_p, v)| v.iter())
+            .filter(move |eh| eh.use_capture == use_capture)
+            .filter_map(|eh| eh.handler.upgrade(mc))
+            .collect()
+    }
+
+    fn prune_dead_handlers(&mut self, event: AvmString<'gc>, mc: &Mutation<'gc>) {
+        let remove_event = if let Some(event_sheaf) = self.0.get_mut(&event) {
+            for set in event_sheaf.values_mut() {
+                set.retain(|handler| handler.handler.is_alive(mc));
+            }
+            event_sheaf.retain(|_, set| !set.is_empty());
+            event_sheaf.is_empty()
+        } else {
+            false
+        };
+
+        if remove_event {
+            self.0.remove(&event);
+        }
+    }
+}
+
+impl Default for DispatchList<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A single instance of an event handler.
+#[derive(Clone, Collect)]
+#[collect(no_drop)]
+struct EventHandler<'gc> {
+    /// The event handler to call.
+    handler: EventHandlerFunction<'gc>,
+
+    /// Indicates if this handler should only be called for capturing events
+    /// (when `true`), or if it should only be called for bubbling and
+    /// at-target events (when `false`).
+    use_capture: bool,
+}
+
+impl<'gc> EventHandler<'gc> {
+    fn new(handler: FunctionObject<'gc>, use_capture: bool, use_weak_reference: bool) -> Self {
+        Self {
+            handler: if use_weak_reference {
+                EventHandlerFunction::Weak(FunctionObjectWeak(Gc::downgrade(handler.0)))
+            } else {
+                EventHandlerFunction::Strong(handler)
+            },
+            use_capture,
+        }
+    }
+}
+
+#[derive(Clone, Collect, Copy)]
+#[collect(no_drop)]
+enum EventHandlerFunction<'gc> {
+    Strong(FunctionObject<'gc>),
+    Weak(FunctionObjectWeak<'gc>),
+}
+
+impl<'gc> EventHandlerFunction<'gc> {
+    fn upgrade(self, mc: &Mutation<'gc>) -> Option<FunctionObject<'gc>> {
+        match self {
+            Self::Strong(handler) => Some(handler),
+            Self::Weak(handler) => handler.0.upgrade(mc).map(FunctionObject),
+        }
+    }
+
+    fn is_alive(self, mc: &Mutation<'gc>) -> bool {
+        self.upgrade(mc).is_some()
+    }
+
+    fn as_ptr(self) -> *const () {
+        match self {
+            Self::Strong(handler) => handler.as_ptr().cast(),
+            Self::Weak(handler) => GcWeak::as_ptr(handler.0).cast(),
+        }
+    }
+}
+
+impl PartialEq for EventHandler<'_> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.use_capture == rhs.use_capture
+            && std::ptr::eq(self.handler.as_ptr(), rhs.handler.as_ptr())
+    }
+}
+
+impl Eq for EventHandler<'_> {}
+
+impl Hash for EventHandler<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.use_capture.hash(state);
+        self.handler.as_ptr().hash(state);
+    }
+}
+
+/// Retrieve the parent of a given `EventDispatcher`.
+///
+/// `EventDispatcher` does not provide a generic way for it's subclasses to
+/// indicate ancestry. Instead, only specific event targets provide a hierarchy
+/// to traverse. If no hierarchy is available, this returns `None`, as if the
+/// target had no parent.
+pub fn parent_of(target: Object<'_>) -> Option<Object<'_>> {
+    if let Some(dobj) = target.as_display_object()
+        && let Some(dparent) = dobj.parent()
+        && let Some(parent) = dparent.object2()
+    {
+        return Some(parent.into());
+    }
+
+    None
+}
+
+/// Call all of the event handlers on a given target.
+///
+/// The `target` is the current target of the `event`. `event` must be a valid
+/// `EventObject`, or this function will panic. You must have already set the
+/// event's phase to match what targets you are dispatching to, or you will
+/// call the wrong handlers.
+fn dispatch_event_to_target<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    dispatcher: Object<'gc>,
+    real_target: Object<'gc>,
+    current_target: Object<'gc>,
+    event: EventObject<'gc>,
+    simulate_dispatch: bool,
+) {
+    avm_debug!(
+        activation.context.avm2,
+        "Event dispatch: {} to {current_target:?}",
+        event.event().event_type(),
+    );
+
+    let dispatch_list = dispatcher.get_slot(slots::DISPATCH_LIST).as_object();
+
+    if dispatch_list.is_none() {
+        // Objects with no dispatch list act as if they had an empty one
+        return;
+    }
+
+    let dispatch_list = dispatch_list.unwrap();
+
+    let mut evtmut = event.event_mut(activation.gc());
+    let name = evtmut.event_type();
+    let use_capture = evtmut.phase() == EventPhase::Capturing;
+
+    let handlers = dispatch_list
+        .as_dispatch_mut(activation.gc())
+        .expect("Internal dispatch list is missing during dispatch!")
+        .event_handlers(name, use_capture, activation.gc());
+
+    if !handlers.is_empty() {
+        evtmut.set_target(real_target);
+        evtmut.set_current_target(current_target);
+    }
+
+    drop(evtmut);
+
+    if simulate_dispatch {
+        return;
+    }
+
+    for handler in handlers.iter() {
+        if event.event().is_propagation_stopped_immediately() {
+            break;
+        }
+
+        // AQW: at most one player snapshot (Static Player Art) per frame.
+        let is_raster_tick = aqw_snapshots::in_enter_frame()
+            && aqw_snapshots::is_raster_tick(handler.executable());
+        if is_raster_tick && aqw_snapshots::budget_used() {
+            // Not this frame: the player keeps animating and the game's
+            // countdown simply resumes next frame.
+            continue;
+        }
+        let snapshot_started = is_raster_tick.then(std::time::Instant::now);
+
+        let global = activation.context.avm2.toplevel_global_object().unwrap();
+
+        let args = &[event.into()];
+        let result = handler.call(activation, global.into(), FunctionArgs::from_slice(args));
+        if let Some(started) = snapshot_started {
+            let done = Value::from(current_target)
+                .get_public_property(crate::string::AvmString::new_utf8(activation.gc(), "isRasterized"), activation)
+                .is_ok_and(|v| v.coerce_to_boolean());
+            if done {
+                aqw_snapshots::note_snapshot(started.elapsed());
+            }
+        }
+        if let Err(err) = result {
+            let event_name = event.event().event_type();
+
+            Avm2::uncaught_error(
+                activation,
+                None, // TODO we need to set this, but how?
+                err,
+                &format!("Error dispatching event \"{}\"", event_name),
+            );
+        }
+    }
+}
+
+pub fn dispatch_event<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    event: EventObject<'gc>,
+    simulate_dispatch: bool,
+) -> bool {
+    let target = this.get_slot(slots::TARGET).as_object().unwrap_or(this);
+
+    let mut ancestor_list = Vec::new();
+    // Edge case - during button construction, we fire bubbling events for objects
+    // that are in the hierarchy (and have `DisplayObject.stage` return the actual stage),
+    // but do not yet have their *parent* object constructed. As a result, we walk through
+    // the parent DisplayObject hierarchy, only adding ancestors that have objects constructed.
+    let mut parent = target.as_display_object().and_then(|dobj| dobj.parent());
+    while let Some(parent_dobj) = parent {
+        if let Some(parent_obj) = parent_dobj.object2() {
+            ancestor_list.push(parent_obj.into());
+        }
+        parent = parent_dobj.parent();
+    }
+
+    event
+        .event_mut(activation.gc())
+        .set_phase(EventPhase::Capturing);
+
+    for ancestor in ancestor_list.iter().rev() {
+        if event.event().is_propagation_stopped() {
+            break;
+        }
+
+        dispatch_event_to_target(
+            activation,
+            *ancestor,
+            target,
+            *ancestor,
+            event,
+            simulate_dispatch,
+        );
+    }
+
+    event
+        .event_mut(activation.gc())
+        .set_phase(EventPhase::AtTarget);
+
+    if !event.event().is_propagation_stopped() {
+        dispatch_event_to_target(activation, this, target, target, event, simulate_dispatch);
+    }
+
+    event
+        .event_mut(activation.context.gc_context)
+        .set_phase(EventPhase::Bubbling);
+
+    if event.event().is_bubbling() {
+        for ancestor in ancestor_list.iter() {
+            if event.event().is_propagation_stopped() {
+                break;
+            }
+
+            dispatch_event_to_target(
+                activation,
+                *ancestor,
+                target,
+                *ancestor,
+                event,
+                simulate_dispatch,
+            );
+        }
+    }
+
+    // If the target is set, the event was handled
+    event.event().target.is_some()
+}
+
+/// Like `dispatch_event`, but does not run the Capturing and Bubbling phases,
+/// and dispatches the event regardless of whether propagation has been stopped.
+/// This matches FP's event broadcasting logic.
+pub fn broadcast_event<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Object<'gc>,
+    event: EventObject<'gc>,
+) {
+    let target = this.get_slot(slots::TARGET).as_object().unwrap_or(this);
+
+    event
+        .event_mut(activation.gc())
+        .set_phase(EventPhase::AtTarget);
+
+    dispatch_event_to_target(activation, this, target, target, event, false);
+}
+
+/// AQW: spreads "Static Player Art" snapshots over frames.
+///
+/// The game (AvatarMC.rasterTick, an enterFrame listener) waits 8 frames
+/// after a player's gear loads and then turns every body part into a bitmap
+/// in one go. When a crowd finishes loading together those snapshots land in
+/// the same frame and cause a hitch. While the option is on, once one
+/// snapshot has happened in a frame, the remaining rasterTick listeners are
+/// skipped for that frame; their players stay animated and snapshot on a
+/// later frame instead.
+pub(crate) mod aqw_snapshots {
+    use crate::avm2::function::BoundMethod;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    const PER_FRAME: u32 = 1;
+
+    thread_local! {
+        static IN_ENTER_FRAME: Cell<bool> = const { Cell::new(false) };
+        static USED: Cell<u32> = const { Cell::new(0) };
+        static IS_RASTER_TICK: RefCell<HashMap<usize, bool>> = RefCell::new(HashMap::new());
+    }
+
+    pub static SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+    pub static SNAPSHOT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SNAPSHOT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+    static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+
+    fn flag() -> &'static AtomicBool {
+        ENABLED.get_or_init(|| {
+            AtomicBool::new(
+                std::env::var("RUFFLE_AQW_SPREAD_SNAPSHOTS")
+                    .map(|v| !matches!(v.trim(), "0" | "false" | "off"))
+                    .unwrap_or(true),
+            )
+        })
+    }
+
+    pub fn enabled() -> bool {
+        flag().load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(on: bool) {
+        flag().store(on, Ordering::Relaxed);
+    }
+
+    /// Called around the per-frame `enterFrame` broadcast.
+    pub fn begin_enter_frame() {
+        USED.with(|u| u.set(0));
+        IN_ENTER_FRAME.with(|f| f.set(true));
+    }
+
+    pub fn end_enter_frame() {
+        IN_ENTER_FRAME.with(|f| f.set(false));
+    }
+
+    pub fn in_enter_frame() -> bool {
+        IN_ENTER_FRAME.with(|f| f.get())
+    }
+
+    pub fn is_raster_tick(exec: &BoundMethod<'_>) -> bool {
+        let method = exec.as_method();
+        let key = method.as_ptr();
+        if let Some(known) = IS_RASTER_TICK.with(|m| m.borrow().get(&key).copied()) {
+            return known;
+        }
+        let name = exec.debug_full_name().to_utf8_lossy().into_owned();
+        let is = name.contains("AvatarMC") && name.ends_with("rasterTick()");
+        IS_RASTER_TICK.with(|m| m.borrow_mut().insert(key, is));
+        is
+    }
+
+    /// Whether this frame's snapshot budget is spent (counts the skip).
+    pub fn budget_used() -> bool {
+        if !enabled() {
+            return false;
+        }
+        let used = USED.with(|u| u.get()) >= PER_FRAME;
+        if used {
+            DEFERRED.fetch_add(1, Ordering::Relaxed);
+        }
+        used
+    }
+
+    pub fn note_snapshot(took: Duration) {
+        USED.with(|u| u.set(u.get() + 1));
+        let ns = took.as_nanos() as u64;
+        SNAPSHOTS.fetch_add(1, Ordering::Relaxed);
+        SNAPSHOT_NS.fetch_add(ns, Ordering::Relaxed);
+        SNAPSHOT_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    }
+}

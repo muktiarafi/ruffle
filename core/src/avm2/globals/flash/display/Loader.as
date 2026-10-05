@@ -1,0 +1,65 @@
+package flash.display {
+    import flash.display.LoaderInfo;
+    import flash.display.DisplayObject;
+    import flash.errors.IllegalOperationError;
+    import flash.system.LoaderContext;
+    import flash.utils.ByteArray;
+    import flash.net.URLRequest;
+    import flash.events.UncaughtErrorEvents;
+
+    [Ruffle(InstanceAllocator)]
+    public class Loader extends DisplayObjectContainer {
+
+        [Ruffle(NativeAccessible)]
+        private var _contentLoaderInfo:LoaderInfo;
+
+        public function get contentLoaderInfo():LoaderInfo {
+            return this._contentLoaderInfo;
+        }
+
+        public function get content():DisplayObject {
+            return this._contentLoaderInfo.content;
+        }
+
+        public native function load(request:URLRequest, context:LoaderContext = null):void;
+
+        public native function loadBytes(data:ByteArray, context:LoaderContext = null):void;
+
+        public function unload():void {
+            this._unload(false);
+        }
+        [API("662")]
+        public function unloadAndStop(gc:Boolean = true):void {
+            this._unload(true);
+        }
+
+        private native function _unload(stop_sounds:Boolean):void;
+
+        public native function close():void;
+
+        override public function addChild(child:DisplayObject):DisplayObject {
+            throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+        }
+
+        override public function addChildAt(child:DisplayObject, index:int):DisplayObject {
+            throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+        }
+
+        override public function removeChild(child:DisplayObject):DisplayObject {
+            throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+        }
+
+        override public function removeChildAt(index:int):DisplayObject {
+            throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+        }
+
+        override public function setChildIndex(child:DisplayObject, index:int):void {
+            throw new IllegalOperationError("Error #2069: The Loader class does not implement this method.", 2069);
+        }
+
+        [API("667")]
+        public function get uncaughtErrorEvents():UncaughtErrorEvents {
+            return this.contentLoaderInfo.uncaughtErrorEvents;
+        }
+    }
+}
