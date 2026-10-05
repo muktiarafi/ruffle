@@ -1,0 +1,141 @@
+name: macOS app (Apple Silicon)
+
+# Builds AQW.app for arm64 on a GitHub-hosted macOS runner and publishes the
+# dmg as a GitHub Release asset. Ad-hoc signed: no Apple Developer account and
+# no secrets are required, so the first launch asks for right-click -> Open.
+#
+# Deliberately separate from .github/workflows/release.yml, which is upstream
+# Ruffle's release pipeline (nightly cron, release.py, RUFFLE_BUILD_TOKEN).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, and the version baked into the bundle
+        required: true
+        default: V3.2
+
+permissions:
+  contents: write
+
+jobs:
+  app:
+    name: Build AQW.app (arm64) and publish the dmg
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      TAG: ${{ inputs.tag }}
+      DMG: AQW-Ruffle-${{ inputs.tag }}-arm64.dmg
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Non-cone patterns: check out everything, minus the two trees that
+          # have nothing to do with compiling. release/ is 530 MB of committed
+          # Windows binaries (including a vendored Electron launcher carrying a
+          # second copy of the six exes) and tests/tests/swfs is the SWF fixture
+          # corpus; together they are ~96% of the 720 MB working tree and none of
+          # it is read by `cargo build -p ruffle_desktop`. Every workspace
+          # member's Cargo.toml is kept, because cargo has to load the manifest
+          # of every member to resolve the workspace even when it builds one.
+          sparse-checkout: |
+            /*
+            !/release/
+            !/tests/tests/swfs/
+          sparse-checkout-cone-mode: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache the cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      # Upstream CI builds the mac binaries with these features
+      # (.github/workflows/release.yml:139-142). fontconfig-dlopen avoids
+      # needing Homebrew fontconfig; "sandbox" is left out on purpose, so the
+      # game shares ~/Library/Application Support/ruffle instead of living in a
+      # per-bundle-id container.
+      - name: Build ruffle_desktop
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ruffle_desktop --profile artix \
+            --target aarch64-apple-darwin \
+            --features jpegxr,fontconfig-dlopen
+
+      - name: Assemble AQW.app
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/artix/ruffle_desktop
+          test -f "$BIN"
+
+          rm -rf AQW.app
+          cp -R desktop/packages/macOS AQW.app
+          mkdir -p AQW.app/Contents/MacOS AQW.app/Contents/Resources
+          mv "$BIN" AQW.app/Contents/MacOS/aqw-real
+
+          P=AQW.app/Contents/Info.plist
+          plutil -replace CFBundleIdentifier -string com.muktiarafi.aqw-ruffle "$P"
+          plutil -replace CFBundleName -string AQW "$P"
+          plutil -replace CFBundleDisplayName -string AQW "$P"
+          plutil -replace CFBundleExecutable -string AQW "$P"
+          # These three keys are absent upstream, so insert rather than replace.
+          plutil -insert CFBundleShortVersionString -string "$TAG" "$P"
+          plutil -insert CFBundleVersion -string "${TAG#V}" "$P"
+          plutil -insert LSMinimumSystemVersion -string "11.0" "$P"
+
+          cp .github/macos/AQW-launcher.sh AQW.app/Contents/MacOS/AQW
+          chmod +x AQW.app/Contents/MacOS/AQW AQW.app/Contents/MacOS/aqw-real
+          # Ruffle is MIT OR Apache-2.0; keep the notice with the renamed binary.
+          cp LICENSE.md AQW.app/Contents/Resources/LICENSE.md
+
+          codesign --force --deep --sign - AQW.app
+          codesign -vvv AQW.app
+          plutil -p "$P"
+
+      - name: Make the dmg
+        run: |
+          set -euo pipefail
+          rm -rf stage
+          mkdir stage
+          cp -R AQW.app stage/
+          ln -s /Applications stage/Applications
+          hdiutil create -volname "AQW $TAG" -srcfolder stage -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          cat "$DMG.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AQW-macos-arm64-${{ inputs.tag }}
+          path: |
+            ${{ env.DMG }}
+            ${{ env.DMG }}.sha256
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" "$DMG.sha256" --clobber
+          else
+            gh release create "$TAG" "$DMG" "$DMG.sha256" \
+              --title "AQW $TAG (macOS, Apple Silicon)" \
+              --notes "$(printf '%s\n' \
+                "Apple Silicon (arm64) build of AQW-Ruffle $TAG. Requires macOS 11 or newer." \
+                "" \
+                "The app is ad-hoc signed, not notarized. Install with:" \
+                "1. Open the dmg and drag AQW.app to /Applications" \
+                "2. Right-click AQW.app, choose Open, then Open again" \
+                "3. If macOS only offers Done/Move to Trash, run:" \
+                "   xattr -dr com.apple.quarantine /Applications/AQW.app" \
+                "" \
+                "The game itself is fetched from game.aq.com at launch; no Artix content ships in the bundle.")"
+          fi
+          gh release view "$TAG" --json url,assets --jq '"\(.url)", (.assets[] | "  \(.name)  \(.size) bytes")'
